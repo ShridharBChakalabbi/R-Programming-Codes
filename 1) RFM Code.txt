@@ -1,0 +1,174 @@
+library(sqldf)
+library(RMySQL)
+library(plyr)
+library(dplyr)
+library(reshape2)
+library(rpart)
+library(RColorBrewer)
+#install.packages("https://cran.r-project.org/bin/windows/contrib/3.3/RGtk2_2.20.31.zip", repos=NULL)
+#library(rattle)
+library(lubridate)
+###############
+################ to get the connection between sql and R
+con = dbConnect(MySQL(), user='mobiloansteam', password='team123456', dbname='mobiloans', host='34.214.211.162')
+Listtables<-dbListTables(con)
+options(sqldf.driver="SQLite")
+
+seq_date1 <- Sys.Date()-67
+seq_date2 <- seq_date1-15
+#################################
+Auto_dialer <-dbGetQuery(con,paste("SELECT * FROM mobiloans.mobiloans_auto_dialer where date(date)= '",seq_date1,"'"))
+Auto_dialer[Auto_dialer==""] <- NA
+# Auto_dialer$LastNSFDate <- as.Date(as.character(Auto_dialer$LastNSFDate))
+# Auto_dialer$NextActivityDate <- as.Date(as.character(Auto_dialer$NextActivityDate))
+# Auto_dialer$LastActivityTime <- as.Date(as.character(Auto_dialer$LastActivityTime))
+
+
+manual_dialer <-dbGetQuery(con,paste("SELECT * FROM mobiloans.mobiloans_manual_dialer where date(date)='",seq_date1,"'"))
+#manual_dialer <- read.csv("20180321_Mobiloans_ManualDialer.CSV")
+# manual_dialer$last_nsf_date <- as.Date(as.character(manual_dialer$last_nsf_date))
+# manual_dialer$nextActivityDate <- as.Date(as.character(manual_dialer$nextActivityDate))
+# manual_dialer$lastActivityTime <- as.Date(as.character(manual_dialer$lastActivityTime))
+
+
+
+##################### combining the auto and manual dialer with respect
+################# to the column names and all 
+names(Auto_dialer)
+names(manual_dialer)
+Auto_dialer1 <- Auto_dialer[,-3] ### removing extra column
+manual_dialer1 <- manual_dialer[,-c(21,22,23)] ### removing extra columns
+names(manual_dialer1) <- names(Auto_dialer1) #####changing the manual dialer names
+com <- rbind.fill(Auto_dialer1,manual_dialer1) #### complete data 
+##################################
+sql_payment <- dbGetQuery(con,paste("SELECT * FROM mobiloans.mobiloans_payment_file where 
+transaction_type_description='Payment' and date(transaction_effective_date)>='",seq_date2,"'
+and date(transaction_effective_date)>='",seq_date1,"'
+and transaction_code in ('121','127','135')"))
+
+names(sql_payment)
+sql_payment$transaction_effective_date <- as.Date(sql_payment$transaction_effective_date)
+
+payment <- dbGetQuery(con,paste("SELECT * FROM mobiloans.mobiloans_payment_file where 
+reversal_transaction_id!='' and date(transaction_effective_date)>='",seq_date2,"'
+                                    and date(transaction_effective_date)>='",seq_date1,"' 
+                                    and transaction_type='91'"))
+
+
+r<-aggregate(transaction_effective_date~loan_number,data=sql_payment,FUN=max)
+
+##############################
+############### getting RFM     ###############
+##############Recency###############################################################
+r<-aggregate(transaction_effective_date~loan_number,data=sql_payment,FUN=max)
+com$rec_date <- r$transaction_effective_date[match(com$AccountNumber,r$loan_number)]
+max_date<-max(com$rec_date,na.rm = T)
+com$recency<-(max_date-com$rec_date)+1
+r_recency_quartile<-quantile(com$recency,c(0,.2,.4,.6,.8,1),na.rm = T)
+r_recency_quartile[1]<-r_recency_quartile[1]-1
+com$r_score<-cut(as.numeric(com$recency),breaks=r_recency_quartile,labels = 5:1)
+
+#########################Frequency##########################################
+sql_payment1 <- sql_payment[sql_payment$transaction_code=="121",]
+freq<-data.frame(table(sql_payment1$loan_number))
+com$freq <- freq$Freq[match(com$AccountNumber,freq$Var1)]
+
+###frequency_quartile<-quantile(freq$Freq,c(0,.2,.4,.6,.8,1)) show error use below code
+frequency_quartile<-quantile(unique(com$freq),c(0,.2,.4,.6,.8,1),na.rm = T)
+frequency_quartile[1]<-(frequency_quartile[1]-1)
+com$f_score<-cut((as.numeric(com$freq)),breaks=frequency_quartile,labels = 1:5)
+
+####################Monetry################################################
+sql_payment$transaction_amount <- as.numeric(sql_payment$transaction_amount)
+payment$transaction_amount <- as.numeric(payment$transaction_amount)
+monitery<-aggregate(transaction_amount~loan_number,data=sql_payment,FUN=sum)
+monitery[is.na(monitery)] <- 0
+monitery1<-aggregate(transaction_amount~loan_number,data=payment,FUN=sum)
+monitery1[is.na(monitery1)] <- 0
+
+monitery$rev_payment<-monitery1$transaction_amount[match(monitery$loan_number,monitery1$loan_number)]
+monitery$rev_payment[is.na(monitery$rev_payment)] <- 0
+monitery$actual_payment <- monitery$transaction_amount-monitery$rev_payment
+monitery$actual_payment <- ifelse(monitery$actual_payment<1,0,monitery$actual_payment)
+monitery$amount_due <- com$AmountDue[match(monitery$loan_number,com$AccountNumber)]
+monitery$payment_cap <- monitery$actual_payment/as.numeric(monitery$amount_due)
+#################
+com$monitory <- monitery$payment_cap[match(com$AccountNumber,monitery$loan_number)]
+
+monitery_quantile<-quantile(unique(com$monitory),c(0,.2,.4,.6,.8,1),na.rm = T)
+monitery_quantile[1]<-monitery_quantile[1]-1
+com$m_score<-cut(as.numeric(com$monitory),breaks=monitery_quantile,labels = 1:5)
+
+##########
+
+
+######################
+# names(monitery)
+# r$Freq <- freq$Freq[match(r$loan_number,freq$Var1)]
+# r$f_score <- freq$f_score[match(r$loan_number,freq$Var1)]
+# 
+# r$payment <- monitery$transaction_amount[match(r$loan_number,monitery$loan_number)]
+# r$m_score <- monitery$m_score[match(r$loan_number,monitery$loan_number)]
+
+################score for days_past_due
+
+# user_info <- ddply(com,.(AccountNumber),summarise,Max_days_pastdue=max(DaysPastDue),
+#                    CurrentBalance=CurrentBalance,CreditLimit=CreditLimit)
+# user_info$Max_days_pastdue <- as.numeric(user_info$Max_days_pastdue)
+Max_days_pastdue_quantile<-quantile(unique(as.numeric(com$DaysPastDue)),c(0,.2,.4,.6,.8,1))
+Max_days_pastdue_quantile[1]<-Max_days_pastdue_quantile[1]-1
+com$score_DaysPastDue<-cut(as.numeric(com$DaysPastDue),breaks=Max_days_pastdue_quantile,labels = 5:1)
+
+################score Credit limit and due
+com$Cb_cl <- as.numeric(com$CurrentBalance)/as.numeric(com$CreditLimit)
+Cb_cl_quantile<-quantile(unique(com$Cb_cl),c(0,.2,.4,.6,.8,1))
+Cb_cl_quantile[1]<-Cb_cl_quantile[1]-1
+com$score_credit<-cut(as.numeric(com$Cb_cl),breaks=Cb_cl_quantile,labels = 5:1)
+
+###########################
+nsf <- data.frame(table(payment$loan_number))
+com$count_nsf <- nsf$Freq[match(com$AccountNumber,nsf$Var1)]
+com$count_nsf[is.na(com$nsf_score)] <- 0
+nsf_quantile<-quantile(unique(com$count_nsf),c(0,.2,.4,.6,.8,1),na.rm = T)
+nsf_quantile[1]<-nsf_quantile[1]-1
+com$nsf_score<-cut(as.numeric(com$count_nsf),breaks=nsf_quantile,labels = 5:1)
+
+###########################
+
+names(com)
+final <- com[,c(23,25,27,28,30)]
+final <- data.frame(sapply(final,function(x) as.numeric(as.character(x))))
+final[is.na(final)] <- 0
+################
+
+write.csv(final,"scoring_of_accounts.csv",row.names = F)
+
+library(cluster) 
+library(mclust)
+library(factoextra)
+library(clv)
+
+
+
+new <- final
+names(new)
+wss <- (nrow(new)-1)*sum(apply(new,2,var))
+for (i in 2:15) wss[i] <- sum(kmeans(new, 
+                                     centers=i)$withinss)
+plot(1:15, wss, type="b", xlab="Number of Clusters",
+     ylab="Within groups sum of squares")
+
+
+fit <- kmeans(new,3) # 3 cluster solution
+fviz_cluster(fit,new, frame = FALSE, geom = "point",main = "K_means")
+
+# get cluster means 
+aggregate(new,by=list(fit$cluster),FUN=mean)
+# append cluster assignment
+mydata <- data.frame(com, fit$cluster)
+
+mydata$segment <- ifelse(mydata$fit.cluster==2,"current",ifelse(mydata$fit.cluster==1,"settler","partly_paid"))
+table(mydata$segment)
+
+write.csv(mydata,"cluster_output.csv",row.names = F)
+
